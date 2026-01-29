@@ -1,97 +1,124 @@
 import numpy as np
 import pandas as pd
-import tensorflow as pd_tf # 别名处理
+import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
+from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
+from sklearn.preprocessing import StandardScaler
+from collections import Counter
 
-# --- 1. 加载并增强数据 ---
-print("正在处理数据...")
+# --- 1. 加载数据 ---
+print("正在加载数据...")
 df = pd.read_csv('btc_history_2y.csv')
 
-# 特征工程：添加技术指标
-# AI 需要看到趋势，不仅仅是价格
-df['SMA_15'] = df['close'].rolling(window=15).mean()
-df['SMA_60'] = df['close'].rolling(window=60).mean()
-df['Vol_Change'] = df['volume'].pct_change()
+# --- 2. 特征工程 (关键修改：使用收益率而非绝对价格) ---
+# 计算对数收益率 (Log Return)，这是金融建模的标准
+# 它能把非平稳的价格序列变成平稳序列
+df['log_ret'] = np.log(df['close'] / df['close'].shift(1))
 
-# RSI 计算
-delta = df['close'].diff()
-gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-rs = gain / loss
-df['RSI'] = 100 - (100 / (1 + rs))
+# 波动率特征
+df['volatility'] = df['log_ret'].rolling(window=20).std()
 
-df.dropna(inplace=True) # 去除计算产生的空值
+# 动量特征 (RSI)
+def get_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-# --- 2. 定义目标 ---
-# 目标：预测下一个小时收盘价是涨(1) 还是 跌(0)
-df['Target'] = (df['close'].shift(-1) > df['close']).astype(int)
+df['rsi'] = get_rsi(df['close'])
 
-# 选取 AI 的输入特征
-features = ['close', 'volume', 'SMA_15', 'SMA_60', 'RSI', 'Vol_Change']
+# 均线偏离度 (价格距离均线有多远)
+df['sma_dist'] = (df['close'] - df['close'].rolling(50).mean()) / df['close']
+
+# 清洗空值
+df.dropna(inplace=True)
+
+# --- 3. 重新定义目标 (Target) ---
+# 只有当下一小时涨幅 > 0.25% (0.0025) 时，才标记为 1 (买入机会)
+# 这样 AI 就不会被迫去预测那些无意义的震荡
+threshold = 0.0025 
+df['future_ret'] = df['close'].shift(-1) / df['close'] - 1
+df['Target'] = (df['future_ret'] > threshold).astype(int)
+
+# 检查一下正负样本比例
+print(f"样本分布: {Counter(df['Target'])}")
+# 如果 1 太少 (比如只有 10%)，模型会很难训练。理想情况是 1 占比 30%-40%。
+
+# --- 4. 准备输入数据 ---
+# 我们选取这几个“平稳”的特征
+features = ['log_ret', 'volatility', 'rsi', 'sma_dist']
 data = df[features].values
 target = df['Target'].values
 
-# --- 3. 数据归一化 (非常重要) ---
-scaler = MinMaxScaler(feature_range=(0, 1))
+# 标准化 (StandardScaler 比 MinMax 更适合由于正态分布的数据)
+scaler = StandardScaler()
 data_scaled = scaler.fit_transform(data)
 
-# --- 4. 构建时间序列数据 (Sliding Window) ---
-# LSTM 需要看到历史片段。我们设定 lookback=60
-# 意思是用 过去60小时的数据 -> 预测 第61小时的涨跌
+# 构建时间窗
 X = []
 y = []
-lookback = 60
+lookback = 48 # 缩短一点，看过去48小时
 
 for i in range(lookback, len(data_scaled)):
-    X.append(data_scaled[i-lookback:i]) # 过去60行所有特征
-    y.append(target[i]) # 第i行的目标
+    X.append(data_scaled[i-lookback:i])
+    y.append(target[i])
 
 X, y = np.array(X), np.array(y)
 
-# 划分训练集和测试集 (前80%训练，后20%验证)
-split = int(len(X) * 0.8)
+# 划分数据集 (这次我们不乱序，保留时间顺序)
+split = int(len(X) * 0.85) # 85% 训练
 X_train, X_test = X[:split], X[split:]
 y_train, y_test = y[:split], y[split:]
 
-print(f"构建完成：训练样本 {X_train.shape[0]}, 测试样本 {X_test.shape[0]}")
+# 计算类别权重 (如果暴涨的机会很少，我们要告诉 AI 那个 1 很珍贵)
+# 这能防止 AI 偷懒全猜 0
+total = len(y_train)
+pos = np.sum(y_train)
+neg = total - pos
+weight_for_0 = (1 / neg) * (total / 2.0)
+weight_for_1 = (1 / pos) * (total / 2.0)
+class_weight = {0: weight_for_0, 1: weight_for_1}
 
-# --- 5. 搭建 LSTM 模型 ---
+# --- 5. 改进的模型结构 ---
 model = Sequential()
+# 第一层：更多神经元，加 L2 正则化或是 BatchNormalization
+model.add(LSTM(64, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])))
+model.add(Dropout(0.3)) 
 
-# 第一层 LSTM
-model.add(LSTM(units=50, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])))
-model.add(Dropout(0.2)) # 丢弃20%神经元防止过拟合
+# 第二层
+model.add(LSTM(32, return_sequences=False))
+model.add(Dropout(0.3))
 
-# 第二层 LSTM
-model.add(LSTM(units=50, return_sequences=False))
-model.add(Dropout(0.2))
+model.add(Dense(16, activation='relu'))
+model.add(Dense(1, activation='sigmoid'))
 
-# 输出层 (Sigmoid 激活函数用于输出 0-1 之间的概率)
-model.add(Dense(units=1, activation='sigmoid'))
+# 使用更小的学习率
+opt = tf.keras.optimizers.Adam(learning_rate=0.001)
+model.compile(optimizer=opt, loss='binary_crossentropy', metrics=['accuracy', tf.keras.metrics.Precision(), tf.keras.metrics.Recall()])
 
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+# --- 6. 训练 ---
+print("🚀 开始训练 v2.0 (带阈值过滤)...")
+# EarlyStopping: 如果训练不准了，自动提前停止
+early_stop = tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
 
-# --- 6. 开始训练 ---
-print("🚀 开始训练神经网络 (这可能需要几分钟)...")
-# epochs=20 (学20遍), batch_size=32 (每次学32个样本)
-history = model.fit(X_train, y_train, epochs=20, batch_size=32, validation_data=(X_test, y_test))
+history = model.fit(
+    X_train, y_train, 
+    epochs=50, 
+    batch_size=64, 
+    validation_data=(X_test, y_test),
+    class_weight=class_weight, # 这一步很关键，解决样本不平衡
+    callbacks=[early_stop],
+    verbose=1
+)
 
-# --- 7. 评估结果 ---
+# --- 7. 评估 ---
 print("\n" + "="*30)
-loss, accuracy = model.evaluate(X_test, y_test)
-print(f"最终测试集准确率: {accuracy:.2%}")
+res = model.evaluate(X_test, y_test)
+print(f"准确率 (Accuracy): {res[1]:.2%}")
+print(f"查准率 (Precision - AI说涨真的涨的概率): {res[2]:.2%}")
 print("="*30)
 
-# --- 8. 简单的实战模拟 ---
-# 获取模型预测的概率
-predictions = model.predict(X_test)
-# 如果概率 > 0.5 判为涨，否则判为跌
-pred_labels = (predictions > 0.5).astype(int).flatten()
-
-# 只是为了看最后几条的预测情况
-result_df = pd.DataFrame({'Actual': y_test[-10:], 'Predicted': pred_labels[-10:], 'Prob': predictions[-10:].flatten()})
-print("\n最后 10 个小时的预测对比 (Actual:1涨0跌):")
-print(result_df)
+# 模拟信号分布
+preds = model.predict(X_test)
+print(f"测试集预测信号分布: 超过0.5的比例: {np.mean(preds > 0.5):.2%}")
