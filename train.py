@@ -1,88 +1,97 @@
-import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
+import pandas as pd
+import tensorflow as pd_tf # 别名处理
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
 
-# 1. 读取你刚才下载的数据
-df = pd.read_csv('btc_1h_data.csv')
+# --- 1. 加载并增强数据 ---
+print("正在处理数据...")
+df = pd.read_csv('btc_history_2y.csv')
 
-# --- 2. 特征工程 (Feature Engineering) ---
-# 我们需要手动计算一些指标喂给 AI，而不仅仅是价格
+# 特征工程：添加技术指标
+# AI 需要看到趋势，不仅仅是价格
+df['SMA_15'] = df['close'].rolling(window=15).mean()
+df['SMA_60'] = df['close'].rolling(window=60).mean()
+df['Vol_Change'] = df['volume'].pct_change()
 
-# 简单移动平均线 (SMA)
-df['SMA_10'] = df['close'].rolling(window=10).mean()
-df['SMA_20'] = df['close'].rolling(window=20).mean()
+# RSI 计算
+delta = df['close'].diff()
+gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+rs = gain / loss
+df['RSI'] = 100 - (100 / (1 + rs))
 
-# 相对强弱指标 (RSI) - 手动计算简化版
-def calculate_rsi(data, window=14):
-    delta = data.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+df.dropna(inplace=True) # 去除计算产生的空值
 
-df['RSI'] = calculate_rsi(df['close'])
+# --- 2. 定义目标 ---
+# 目标：预测下一个小时收盘价是涨(1) 还是 跌(0)
+df['Target'] = (df['close'].shift(-1) > df['close']).astype(int)
 
-# 收益率 (Return)
-df['Return'] = df['close'].pct_change()
+# 选取 AI 的输入特征
+features = ['close', 'volume', 'SMA_15', 'SMA_60', 'RSI', 'Vol_Change']
+data = df[features].values
+target = df['Target'].values
 
-# 波动率 (Volatility)
-df['Volatility'] = df['Return'].rolling(window=20).std()
+# --- 3. 数据归一化 (非常重要) ---
+scaler = MinMaxScaler(feature_range=(0, 1))
+data_scaled = scaler.fit_transform(data)
 
-# --- 3. 构建目标 (Labeling) ---
-# 核心问题：下一小时收盘价是否比当前高？
-# shift(-1) 读取的是“下一行”的数据
-df['Next_Close'] = df['close'].shift(-1)
-df['Target'] = (df['Next_Close'] > df['close']).astype(int) 
-# 1 代表涨，0 代表跌/平
+# --- 4. 构建时间序列数据 (Sliding Window) ---
+# LSTM 需要看到历史片段。我们设定 lookback=60
+# 意思是用 过去60小时的数据 -> 预测 第61小时的涨跌
+X = []
+y = []
+lookback = 60
 
-# --- 4. 清洗数据 ---
-# 因为计算指标会有 NaN (空值)，必须去掉，否则模型报错
-df.dropna(inplace=True)
+for i in range(lookback, len(data_scaled)):
+    X.append(data_scaled[i-lookback:i]) # 过去60行所有特征
+    y.append(target[i]) # 第i行的目标
 
-# 定义 AI 的输入 (X) 和 想要预测的答案 (y)
-feature_cols = ['open', 'high', 'low', 'close', 'volume', 'SMA_10', 'SMA_20', 'RSI', 'Return', 'Volatility']
-X = df[feature_cols]
-y = df['Target']
+X, y = np.array(X), np.array(y)
 
-# --- 5. 划分训练集和测试集 ---
-# 重要！！时间序列数据绝对不能打乱顺序 (shuffle=False)
-# 我们用过去 80% 的数据训练，预测最近 20% 的未来
-split = int(len(df) * 0.8)
-X_train, X_test = X.iloc[:split], X.iloc[split:]
-y_train, y_test = y.iloc[:split], y.iloc[split:]
+# 划分训练集和测试集 (前80%训练，后20%验证)
+split = int(len(X) * 0.8)
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
 
-print(f"训练数据量: {len(X_train)} 行, 测试数据量: {len(X_test)} 行")
+print(f"构建完成：训练样本 {X_train.shape[0]}, 测试样本 {X_test.shape[0]}")
 
-# --- 6. 训练模型 (The Training) ---
-print("正在训练 AI 大脑 (Random Forest)...")
-model = RandomForestClassifier(n_estimators=100, min_samples_leaf=5, random_state=42)
-model.fit(X_train, y_train)
+# --- 5. 搭建 LSTM 模型 ---
+model = Sequential()
 
-# --- 7. 验证结果 ---
-# 让 AI 预测测试集
+# 第一层 LSTM
+model.add(LSTM(units=50, return_sequences=True, input_shape=(X_train.shape[1], X_train.shape[2])))
+model.add(Dropout(0.2)) # 丢弃20%神经元防止过拟合
+
+# 第二层 LSTM
+model.add(LSTM(units=50, return_sequences=False))
+model.add(Dropout(0.2))
+
+# 输出层 (Sigmoid 激活函数用于输出 0-1 之间的概率)
+model.add(Dense(units=1, activation='sigmoid'))
+
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# --- 6. 开始训练 ---
+print("🚀 开始训练神经网络 (这可能需要几分钟)...")
+# epochs=20 (学20遍), batch_size=32 (每次学32个样本)
+history = model.fit(X_train, y_train, epochs=20, batch_size=32, validation_data=(X_test, y_test))
+
+# --- 7. 评估结果 ---
+print("\n" + "="*30)
+loss, accuracy = model.evaluate(X_test, y_test)
+print(f"最终测试集准确率: {accuracy:.2%}")
+print("="*30)
+
+# --- 8. 简单的实战模拟 ---
+# 获取模型预测的概率
 predictions = model.predict(X_test)
+# 如果概率 > 0.5 判为涨，否则判为跌
+pred_labels = (predictions > 0.5).astype(int).flatten()
 
-# 计算准确率
-acc = accuracy_score(y_test, predictions)
-print("-" * 30)
-print(f"AI 预测准确率: {acc:.2%}")
-print("-" * 30)
-
-# 查看 AI 觉得哪个指标最重要
-importances = pd.Series(model.feature_importances_, index=feature_cols).sort_values(ascending=False)
-print("\nAI 认为最重要的特征因子：")
-print(importances.head(5))
-
-# 简单回测逻辑：如果 AI 预测涨(1) 我们就持有，否则空仓
-df_test = df.iloc[split:].copy()
-df_test['Prediction'] = predictions
-# 策略收益 = 实际收益率 * 预测操作 (1或0)
-df_test['Strategy_Return'] = df_test['Return'].shift(-1) * df_test['Prediction']
-
-cum_market_return = (1 + df_test['Return'].shift(-1)).cumprod()
-cum_strategy_return = (1 + df_test['Strategy_Return']).cumprod()
-
-print(f"\n基准市场回报 (HODL): {cum_market_return.iloc[-2]:.4f}")
-print(f"AI 策略回报: {cum_strategy_return.iloc[-2]:.4f}")
+# 只是为了看最后几条的预测情况
+result_df = pd.DataFrame({'Actual': y_test[-10:], 'Predicted': pred_labels[-10:], 'Prob': predictions[-10:].flatten()})
+print("\n最后 10 个小时的预测对比 (Actual:1涨0跌):")
+print(result_df)
