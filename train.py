@@ -122,3 +122,50 @@ print("="*30)
 # 模拟信号分布
 preds = model.predict(X_test)
 print(f"测试集预测信号分布: 超过0.5的比例: {np.mean(preds > 0.5):.2%}")
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_score, recall_score
+
+# 1. 获取模型对测试集的预测概率 (0到1之间的小数)
+# 注意：这一步不需要重新训练，直接用刚才训练好的 model
+pred_probs = model.predict(X_test, verbose=0)
+
+print(f"\n{'阈值 (Threshold)':<15} | {'查准率 (Precision)':<18} | {'交易次数 (Signals)':<15} | {'胜率 (Win Rate)':<15}")
+print("-" * 70)
+
+best_threshold = 0.5
+best_precision = 0.0
+
+# 2. 循环测试不同的门槛
+for t in [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80]:
+    # 如果概率 > t，则标记为 1 (买入)，否则为 0
+    my_preds = (pred_probs > t).astype(int)
+    
+    # 只要有过至少一次买入信号，才计算
+    if np.sum(my_preds) > 0:
+        prec = precision_score(y_test, my_preds, zero_division=0)
+        count = np.sum(my_preds)
+        
+        # 简单计算一下这部分信号里的实际胜率 (和 Precision 类似)
+        print(f"{t:<18.2f} | {prec:<22.2%} | {count:<19} | {prec:.2%}")
+        
+        if prec > best_precision and count > 10: # 至少要有10次交易才有统计意义
+            best_precision = prec
+            best_threshold = t
+    else:
+        print(f"{t:<18.2f} | {'无交易信号':<22} | 0")
+
+print("-" * 70)
+print(f"🚀 最佳策略建议：将买入阈值设定为 > {best_threshold}")
+print(f"预期胜率可提升至: {best_precision:.2%}")
+
+# --- 可视化概率分布 ---
+# 看看 AI 到底有多少次是非常确定的？
+plt.figure(figsize=(10, 5))
+plt.hist(pred_probs, bins=50, alpha=0.75, color='blue', edgecolor='black')
+plt.title('AI Prediction Probability Distribution')
+plt.xlabel('Probability (0=Bearish, 1=Bullish)')
+plt.ylabel('Count')
+plt.axvline(x=best_threshold, color='red', linestyle='dashed', linewidth=2, label=f'Best Threshold {best_threshold}')
+plt.legend()
+plt.show()
